@@ -62,9 +62,11 @@ pub enum ProcessState {
 #[derive(Clone, Copy, Debug)]
 pub enum Instruction {
   DbgStack,
+  DbgDrop,
   PushInt(i32),
   PushPid(Pid),
   MakeTuple(u16),
+  GetTuple(u16),
   Add,
   Sub,
   Mul,
@@ -98,6 +100,10 @@ pub struct Heap {
 }
 
 impl Heap {
+  fn get(&self, handle: HeapHandle) -> &HeapValue {
+    &self.memory[handle.index]
+  }
+
   fn allocate_string(&mut self, s: impl Into<String>) -> Value {
     let index = self.memory.len();
     self.memory.push(HeapValue::Str(s.into()));
@@ -169,6 +175,40 @@ impl Process {
       Instruction::DbgStack => {
         println!("{:?}", self.stack);
       }
+      Instruction::DbgDrop => {
+        let value = self.stack.pop().expect("not empty");
+        fn debug_value(
+          value: &Value,
+          heap: &Heap,
+          f: &mut std::fmt::Formatter,
+        ) -> std::fmt::Result {
+          match value {
+            Value::Pid(pid) => write!(f, "Pid({:?})", pid),
+            Value::Int(int) => write!(f, "Int({:?})", int),
+            Value::Atom(atom) => write!(f, "Atom({:?})", atom),
+            Value::Heap(heap_handle) => match heap.get(*heap_handle) {
+              HeapValue::Str(str) => write!(f, "{str}"),
+              HeapValue::Tuple(values) => {
+                write!(f, "{{")?;
+                for i in 0..values.len() {
+                  if i != 0 {
+                    write!(f, ", ")?;
+                  }
+                  debug_value(&values[i], heap, f)?;
+                }
+                write!(f, "}}")
+              }
+            },
+          }
+        }
+        struct Wrapper<'a>(&'a Value, &'a Heap);
+        impl std::fmt::Debug for Wrapper<'_> {
+          fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            debug_value(self.0, self.1, f)
+          }
+        }
+        println!("{:?}", Wrapper(&value, &self.heap))
+      }
       Instruction::PushInt(i) => self.stack.push(Value::Int(i)),
       Instruction::PushPid(pid) => self.stack.push(Value::Pid(pid)),
       Instruction::MakeTuple(len) => {
@@ -176,6 +216,17 @@ impl Process {
         let tuple = self.heap.allocate_tuple(values);
         self.stack.push(tuple);
       }
+      Instruction::GetTuple(len) => match self.stack.pop() {
+        Some(Value::Heap(handle)) => match self.heap.get(handle) {
+          HeapValue::Tuple(values) if (len as usize) < values.len() as usize => {
+            let value = values[len as usize];
+            self.stack.push(value);
+          }
+          HeapValue::Tuple(_) => panic!("arity error"),
+          HeapValue::Str(_) => panic!("expected tuple"),
+        },
+        None | _ => panic!("expected value"),
+      },
       Instruction::Add | Instruction::Sub | Instruction::Mul | Instruction::Div => {
         let Value::Int(rhs) = self.stack.pop().expect("rhs") else {
           panic!("not an integer")
@@ -356,6 +407,136 @@ impl Scheduler {
 }
 
 fn main() {
+  let process_exit = {
+    let this_frame = Frame {
+      code: vec![
+        Instruction::PushInt(0),
+        Instruction::PushInt(3),
+        Instruction::Sub,
+        Instruction::Exit,
+      ],
+      locals: vec![],
+    };
+    Process {
+      pid: Pid::next(),
+      ip: Cell::new(0),
+      state: ProcessState::Runnable,
+      stack: vec![],
+      frames: vec![this_frame],
+      mailbox: VecDeque::new(),
+      scheduler: GLOBAL_SCHEDULER.with(Rc::clone),
+      links: vec![],
+      monitors: vec![],
+      heap: Heap::default(),
+    }
+  };
+
+  let process_main = {
+    let this_frame = Frame {
+      code: vec![
+        Instruction::PushPid(process_exit.pid),
+        Instruction::Monitor,
+        Instruction::Receive,
+        Instruction::DbgDrop,
+        Instruction::Goto(3),
+        Instruction::Exit,
+      ],
+      locals: vec![],
+    };
+    Process {
+      pid: Pid::next(),
+      ip: Cell::new(0),
+      state: ProcessState::Runnable,
+      stack: vec![],
+      frames: vec![this_frame],
+      mailbox: VecDeque::new(),
+      scheduler: GLOBAL_SCHEDULER.with(Rc::clone),
+      links: vec![],
+      monitors: vec![],
+      heap: Heap::default(),
+    }
+  };
+
+  let scheduler = GLOBAL_SCHEDULER.with(Rc::clone);
+
+  unsafe {
+    let scheduler = scheduler.get();
+    (*scheduler).add_process(process_main);
+    (*scheduler).add_process(process_exit);
+    (*scheduler).run();
+  }
+}
+
+#[allow(dead_code)]
+fn program_adder() {
+  let process_main = {
+    let main_frame = Frame {
+      code: vec![
+        Instruction::Receive,
+        Instruction::Store(0),
+        Instruction::Receive,
+        Instruction::Store(1),
+        Instruction::Load(0),
+        Instruction::Load(1),
+        Instruction::Add,
+        Instruction::DbgStack,
+        Instruction::Exit,
+      ],
+      locals: vec![Value::Int(69), Value::Int(69)],
+    };
+    Process {
+      pid: Pid::next(),
+      ip: Cell::new(0),
+      state: ProcessState::Runnable,
+      stack: vec![],
+      frames: vec![main_frame],
+      mailbox: VecDeque::new(),
+      scheduler: GLOBAL_SCHEDULER.with(Rc::clone),
+      links: vec![],
+      monitors: vec![],
+      heap: Heap::default(),
+    }
+  };
+
+  let process_sender = {
+    let frame = Frame {
+      code: vec![
+        Instruction::PushPid(process_main.pid),
+        Instruction::PushInt(3),
+        Instruction::Send,
+        Instruction::PushPid(process_main.pid),
+        Instruction::PushInt(3),
+        Instruction::Send,
+        Instruction::Exit,
+      ],
+      locals: vec![],
+    };
+    Process {
+      pid: Pid::next(),
+      ip: Cell::new(0),
+      state: ProcessState::Runnable,
+      stack: vec![],
+      frames: vec![frame],
+      mailbox: VecDeque::new(),
+      scheduler: GLOBAL_SCHEDULER.with(Rc::clone),
+      links: vec![],
+      monitors: vec![],
+      heap: Heap::default(),
+    }
+  };
+
+  let scheduler = GLOBAL_SCHEDULER.with(Rc::clone);
+
+  unsafe {
+    let scheduler = scheduler.get();
+    (*scheduler).add_process(process_main);
+    (*scheduler).add_process(process_sender);
+    (*scheduler).run();
+  }
+}
+
+#[allow(dead_code)]
+fn program_link() {
   let process_exit1 = {
     let this_frame = Frame {
       code: vec![Instruction::DbgStack, Instruction::Exit],
@@ -430,74 +611,6 @@ fn main() {
     (*scheduler).add_process(process_main);
     (*scheduler).add_process(process_exit2);
     (*scheduler).add_process(process_exit1);
-    (*scheduler).run();
-  }
-}
-
-#[allow(dead_code)]
-fn program_adder() {
-  let process_main = {
-    let main_frame = Frame {
-      code: vec![
-        Instruction::Receive,
-        Instruction::Store(0),
-        Instruction::Receive,
-        Instruction::Store(1),
-        Instruction::Load(0),
-        Instruction::Load(1),
-        Instruction::Add,
-        Instruction::DbgStack,
-        Instruction::Exit,
-      ],
-      locals: vec![Value::Int(69), Value::Int(69)],
-    };
-    Process {
-      pid: Pid::next(),
-      ip: Cell::new(0),
-      state: ProcessState::Runnable,
-      stack: vec![],
-      frames: vec![main_frame],
-      mailbox: VecDeque::new(),
-      scheduler: GLOBAL_SCHEDULER.with(Rc::clone),
-      links: vec![],
-      monitors: vec![],
-      heap: Heap::default(),
-    }
-  };
-
-  let process_sender = {
-    let frame = Frame {
-      code: vec![
-        Instruction::PushPid(process_main.pid),
-        Instruction::PushInt(3),
-        Instruction::Send,
-        Instruction::PushPid(process_main.pid),
-        Instruction::PushInt(3),
-        Instruction::Send,
-        Instruction::Exit,
-      ],
-      locals: vec![],
-    };
-    Process {
-      pid: Pid::next(),
-      ip: Cell::new(0),
-      state: ProcessState::Runnable,
-      stack: vec![],
-      frames: vec![frame],
-      mailbox: VecDeque::new(),
-      scheduler: GLOBAL_SCHEDULER.with(Rc::clone),
-      links: vec![],
-      monitors: vec![],
-      heap: Heap::default(),
-    }
-  };
-
-  let scheduler = GLOBAL_SCHEDULER.with(Rc::clone);
-
-  unsafe {
-    let scheduler = scheduler.get();
-    (*scheduler).add_process(process_main);
-    (*scheduler).add_process(process_sender);
     (*scheduler).run();
   }
 }
