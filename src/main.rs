@@ -32,6 +32,7 @@ pub struct Atom(u32);
 
 const ATOM_EXIT: Atom = Atom(0);
 const ATOM_NORMAL: Atom = Atom(1);
+const ATOM_EXPECTED_VALUE: Atom = Atom(2);
 
 #[derive(Clone, Copy, Debug)]
 pub struct HeapHandle {
@@ -55,11 +56,16 @@ pub enum HeapValue {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ProcessState {
-  // TODO: do we need this Runnable state?
-  Runnable,
-  Waiting,
-  Running,
-  Exiting,
+  Runnable = 1 << 0,
+  Running = 1 << 1,
+  Waiting = 1 << 2,
+  Exiting = 1 << 3,
+}
+
+impl ProcessState {
+  const fn is_runnable(&self) -> bool {
+    (*self as u8 & 0b11) != 0
+  }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -98,6 +104,16 @@ pub struct Frame {
 #[repr(transparent)]
 pub struct Mailbox {
   queue: VecDeque<Value>,
+}
+
+impl Mailbox {
+  pub fn send(&mut self, message: Value) {
+    self.queue.push_back(message);
+  }
+
+  pub fn receive(&mut self) -> Option<Value> {
+    self.queue.pop_front()
+  }
 }
 
 #[derive(Debug, Default)]
@@ -152,13 +168,23 @@ pub struct Process {
   pub state: ProcessState,
   pub stack: Vec<Value>,
   pub frames: Vec<Frame>,
-  pub mailbox: VecDeque<Value>,
+  pub mailbox: Mailbox,
   pub scheduler: Rc<UnsafeCell<Scheduler>>,
   pub links: Vec<Pid>,
   pub monitors: Vec<Pid>,
   pub heap: Heap,
   /// if None, exit normally
   pub exit_reason: Option<Value>,
+}
+
+#[derive(Clone, Copy)]
+#[repr(i32)]
+pub enum Weight {
+  None = 0,
+  One = 1,
+  Two = 2,
+  Three = 3,
+  Four = 4,
 }
 
 impl Process {
@@ -176,12 +202,13 @@ impl Process {
     *ip -= 1;
   }
 
-  pub fn step(&mut self) -> ProcessState {
+  pub fn step(&mut self) -> Weight {
     macro_rules! pop_or_exit {
       ($self:expr, $name:ident) => {
         let Some($name) = $self.stack.pop() else {
+          $self.exit_reason = Some(Value::Atom(ATOM_EXPECTED_VALUE));
           $self.state = ProcessState::Exiting;
-          return $self.state;
+          return Weight::None;
         };
       };
     }
@@ -191,6 +218,7 @@ impl Process {
     match instruction {
       Instruction::DbgStack => {
         println!("{:?}", self.stack);
+        Weight::One
       }
       Instruction::DbgDrop => {
         pop_or_exit!(self, value);
@@ -224,20 +252,29 @@ impl Process {
             debug_value(self.0, self.1, f)
           }
         }
-        println!("{:?}", Wrapper(&value, &self.heap))
+        println!("{:?}", Wrapper(&value, &self.heap));
+        Weight::One
       }
-      Instruction::PushInt(i) => self.stack.push(Value::Int(i)),
-      Instruction::PushPid(pid) => self.stack.push(Value::Pid(pid)),
+      Instruction::PushInt(i) => {
+        self.stack.push(Value::Int(i));
+        Weight::None
+      }
+      Instruction::PushPid(pid) => {
+        self.stack.push(Value::Pid(pid));
+        Weight::None
+      }
       Instruction::MakeTuple(len) => {
         let values = self.stack.split_off(self.stack.len() - len as usize);
         let tuple = self.heap.allocate_tuple(values);
         self.stack.push(tuple);
+        Weight::One
       }
       Instruction::GetTuple(len) => match self.stack.pop() {
         Some(Value::Heap(handle)) => match self.heap.get(handle) {
           HeapValue::Tuple(values) if (len as usize) < values.len() => {
             let value = values[len as usize];
             self.stack.push(value);
+            Weight::One
           }
           HeapValue::Tuple(_) => panic!("arity error"),
           HeapValue::Str(_) => panic!("expected tuple"),
@@ -259,8 +296,13 @@ impl Process {
           _ => unreachable!(),
         };
         self.stack.push(Value::Int(result));
+
+        Weight::None
       }
-      Instruction::This => self.stack.push(Value::Pid(self.pid)),
+      Instruction::This => {
+        self.stack.push(Value::Pid(self.pid));
+        Weight::None
+      }
       Instruction::Link => {
         let Value::Pid(pid) = self.stack.pop().expect("target") else {
           panic!("expected pid");
@@ -277,6 +319,8 @@ impl Process {
         if !self.links.contains(&pid) {
           self.links.push(pid);
         }
+
+        Weight::Two
       }
       Instruction::Monitor => {
         let Value::Pid(pid) = self.stack.pop().expect("target") else {
@@ -289,6 +333,8 @@ impl Process {
           if !other.monitors.contains(&self.pid) {
             other.monitors.push(self.pid);
           }
+
+          Weight::Two
         }
       }
       Instruction::Send => {
@@ -304,47 +350,63 @@ impl Process {
             .expect("process exists");
 
           let message = self.heap.deep_clone_at(message, &mut other.heap);
-          other.mailbox.push_back(message);
+          other.mailbox.send(message);
 
           if other.state == ProcessState::Waiting {
             other.state = ProcessState::Runnable;
             (*scheduler).task_queue.push_back(other.pid);
           }
+
+          Weight::Three
         }
       }
-      Instruction::Receive => match self.mailbox.pop_front() {
-        Some(message) => self.stack.push(message),
+      Instruction::Receive => match self.mailbox.receive() {
+        Some(message) => {
+          self.stack.push(message);
+          Weight::Two
+        }
         None => {
           self.rewind();
           self.state = ProcessState::Waiting;
+          Weight::Four
         }
       },
       Instruction::Store(index) => {
         let frame = self.frames.last_mut().expect("not empty");
         pop_or_exit!(self, value);
         frame.locals[index as usize] = value;
+        Weight::One
       }
       Instruction::Load(index) => {
         let frame = self.frames.last_mut().expect("not empty");
         let value = frame.locals[index as usize];
         self.stack.push(value);
+        Weight::One
       }
       Instruction::Goto(index) => {
         self.ip.set(index as usize);
+        Weight::None
       }
       Instruction::Return => match self.frames.pop() {
         Some(frame) => {
           self.ip = frame.ip;
+          Weight::One
         }
-        None => self.state = ProcessState::Exiting,
+        None => {
+          self.state = ProcessState::Exiting;
+          Weight::Three
+        }
       },
       Instruction::ExitReason => {
         self.exit_reason = Some(self.stack.pop().unwrap());
         self.state = ProcessState::Exiting;
+        Weight::Three
       }
-      Instruction::Exit => self.state = ProcessState::Exiting,
-    };
-    self.state
+      Instruction::Exit => {
+        self.state = ProcessState::Exiting;
+        Weight::Three
+      }
+    }
   }
 }
 
@@ -374,15 +436,19 @@ impl Scheduler {
 
       let mut w = 0i32;
 
-      while (w < 8) & (process.state != ProcessState::Exiting) {
-        match process.step() {
-          ProcessState::Runnable => {
-            process.state = ProcessState::Running;
-            w += 2;
-          }
-          ProcessState::Running => w += 2,
-          ProcessState::Waiting | ProcessState::Exiting => break,
+      while (w < 8) & (process.state.is_runnable()) {
+        if process.state == ProcessState::Runnable {
+          process.state = ProcessState::Running;
         }
+        w += process.step() as i32
+        // match process.step() {
+        //   ProcessState::Runnable => {
+        //     process.state = ProcessState::Running;
+        //     w += 2;
+        //   }
+        //   ProcessState::Running => w += 2,
+        //   ProcessState::Waiting | ProcessState::Exiting => break,
+        // }
       }
 
       match process.state {
@@ -397,7 +463,7 @@ impl Scheduler {
 
             for linked_pid in &process.links {
               // TODO: cascading?
-              if let Some(link) = self.processes.get_mut(&linked_pid) {
+              if let Some(link) = self.processes.get_mut(linked_pid) {
                 eprintln!(
                   "process {:?} exiting due to linked {:?}",
                   link.pid, process.pid
@@ -434,7 +500,7 @@ impl Scheduler {
                 ]),
               };
 
-              monitor.mailbox.push_back(exit);
+              monitor.mailbox.send(exit);
 
               if monitor.state == ProcessState::Waiting {
                 monitor.state = ProcessState::Runnable;
@@ -450,5 +516,5 @@ impl Scheduler {
 }
 
 fn main() {
-  tests::program_monitor();
+  tests::program_adder();
 }

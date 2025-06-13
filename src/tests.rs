@@ -1,6 +1,8 @@
-use std::{cell::Cell, collections::VecDeque, rc::Rc};
+use std::{cell::Cell, rc::Rc};
 
-use crate::{Frame, GLOBAL_SCHEDULER, Heap, Instruction, Pid, Process, ProcessState, Value};
+use crate::{
+  Frame, GLOBAL_SCHEDULER, Heap, Instruction, Mailbox, Pid, Process, ProcessState, Value,
+};
 
 #[allow(dead_code)]
 pub fn program_monitor() {
@@ -21,7 +23,7 @@ pub fn program_monitor() {
       state: ProcessState::Runnable,
       stack: vec![],
       frames: vec![this_frame, frame_return_zero],
-      mailbox: VecDeque::new(),
+      mailbox: Mailbox::default(),
       scheduler: GLOBAL_SCHEDULER.with(Rc::clone),
       links: vec![],
       monitors: vec![],
@@ -49,7 +51,7 @@ pub fn program_monitor() {
       state: ProcessState::Runnable,
       stack: vec![],
       frames: vec![this_frame],
-      mailbox: VecDeque::new(),
+      mailbox: Mailbox::default(),
       scheduler: GLOBAL_SCHEDULER.with(Rc::clone),
       links: vec![],
       monitors: vec![],
@@ -92,7 +94,7 @@ pub fn program_adder() {
       state: ProcessState::Runnable,
       stack: vec![],
       frames: vec![main_frame],
-      mailbox: VecDeque::new(),
+      mailbox: Mailbox::default(),
       scheduler: GLOBAL_SCHEDULER.with(Rc::clone),
       links: vec![],
       monitors: vec![],
@@ -121,7 +123,7 @@ pub fn program_adder() {
       state: ProcessState::Runnable,
       stack: vec![],
       frames: vec![frame],
-      mailbox: VecDeque::new(),
+      mailbox: Mailbox::default(),
       scheduler: GLOBAL_SCHEDULER.with(Rc::clone),
       links: vec![],
       monitors: vec![],
@@ -154,7 +156,7 @@ pub fn program_link() {
       state: ProcessState::Runnable,
       stack: vec![],
       frames: vec![this_frame],
-      mailbox: VecDeque::new(),
+      mailbox: Mailbox::default(),
       scheduler: GLOBAL_SCHEDULER.with(Rc::clone),
       links: vec![],
       monitors: vec![],
@@ -180,7 +182,7 @@ pub fn program_link() {
       state: ProcessState::Runnable,
       stack: vec![],
       frames: vec![this_frame],
-      mailbox: VecDeque::new(),
+      mailbox: Mailbox::default(),
       scheduler: GLOBAL_SCHEDULER.with(Rc::clone),
       links: vec![],
       monitors: vec![],
@@ -206,7 +208,7 @@ pub fn program_link() {
       state: ProcessState::Runnable,
       stack: vec![],
       frames: vec![main_frame],
-      mailbox: VecDeque::new(),
+      mailbox: Mailbox::default(),
       scheduler: GLOBAL_SCHEDULER.with(Rc::clone),
       links: vec![],
       monitors: vec![],
